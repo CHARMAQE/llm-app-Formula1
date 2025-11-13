@@ -1,0 +1,214 @@
+import { NextRequest, NextResponse } from 'next/server';
+import { DataAPIClient } from "@datastax/astra-db-ts";
+import { getRelevantF1Info } from '../../../lib/f1-knowledge';
+
+const {
+  ASTRA_DB_NAMESPACE,
+  ASTRA_DB_COLLECTION,
+  ASTRA_DB_API_ENDPOINT,
+  ASTRA_DB_APPLICATION_TOKEN,
+} = process.env;
+
+// Simple embedding function (same as in your data loader)
+function createSimpleEmbedding(text: string): number[] {
+  const words = text.toLowerCase().split(/\s+/);
+  const embedding = new Array(384).fill(0);
+  
+  for (let i = 0; i < words.length; i++) {
+    const word = words[i];
+    for (let j = 0; j < word.length; j++) {
+      const charCode = word.charCodeAt(j);
+      const index = (charCode + i * j) % 384;
+      embedding[index] += 1 / (word.length + 1);
+    }
+  }
+  
+  const magnitude = Math.sqrt(embedding.reduce((sum, val) => sum + val * val, 0));
+  return embedding.map(val => magnitude > 0 ? val / magnitude : 0);
+}
+
+const client = new DataAPIClient(ASTRA_DB_APPLICATION_TOKEN);
+const db = client.db(ASTRA_DB_API_ENDPOINT, { namespace: ASTRA_DB_NAMESPACE });
+
+export async function POST(request: NextRequest) {
+  try {
+    const { message } = await request.json();
+    
+    if (!message) {
+      return NextResponse.json({ error: 'Message is required' }, { status: 400 });
+    }
+
+    // Search the vector database
+    const collection = await db.collection(ASTRA_DB_COLLECTION);
+    const queryVector = createSimpleEmbedding(message);
+    
+    // Search for both manual and scraped content, but prioritize manual
+    const [manualResults, allResults] = await Promise.all([
+      // Search specifically for manual content
+      collection.find(
+        { source: 'manual_content' },
+        {
+          vector: queryVector,
+          limit: 5,
+        }
+      ).toArray(),
+      // Search all content
+      collection.find(
+        {},
+        {
+          vector: queryVector,
+          limit: 10,
+        }
+      ).toArray()
+    ]);
+
+    // Prioritize manual content strongly
+    let finalResults = [];
+    if (manualResults.length > 0) {
+      finalResults = [...manualResults, ...allResults.filter(r => r.source !== 'manual_content')];
+    } else {
+      finalResults = allResults;
+    }
+    
+    // Process and clean the results with even more aggressive cleaning
+    const context = finalResults
+      .map(result => {
+        // If it's manual content, return it with minimal processing
+        if (result.source === 'manual_content') {
+          return {
+            text: result.text,
+            isClean: true,
+            title: result.title,
+            category: result.category
+          };
+        }
+        
+        // For scraped content, apply aggressive cleaning
+        let cleanText = result.text || '';
+        
+        // Remove all JSON structures and technical data
+        cleanText = cleanText.replace(/[{}"[\]]/g, ' ');
+        cleanText = cleanText.replace(/:\s*[^,}\s]+/g, ' ');
+        cleanText = cleanText.replace(/\$[^,\s}]+/g, ' '); // Remove React patterns like $, div, etc
+        cleanText = cleanText.replace(/\\\\/g, ' '); // Remove escaped backslashes
+        
+        // Remove all technical terms
+        cleanText = cleanText.replace(/\b(className|children|id|src|alt|width|height|contentType|public_id|raw_transformation|thumbnail|image|title|description|publishedAt|updatedAt|realUpdatedAt|locale)\b/gi, ' ');
+        cleanText = cleanText.replace(/\b(null|undefined|true|false|div|span|button|img|href|rel|target)\b/gi, ' ');
+        
+        // Remove CSS classes and module names
+        cleanText = cleanText.replace(/\b[\w-]*module[\w-]*\b/gi, ' ');
+        cleanText = cleanText.replace(/\b[\w-]*display[\w-]*\b/gi, ' ');
+        cleanText = cleanText.replace(/\b(typography|Text|upper|lower|px-\d+|pb-\w+|lg|xl|sm|md|text-\w+)\b/gi, ' ');
+        
+        // Remove dimensions and technical IDs
+        cleanText = cleanText.replace(/\b\d+x\d+\b/g, ' ');
+        cleanText = cleanText.replace(/\b[a-f0-9]{8,}\b/gi, ' ');
+        cleanText = cleanText.replace(/\bhttps?:\/\/[^\s,}]+/gi, ' ');
+        
+        // Remove HTML and special characters
+        cleanText = cleanText.replace(/<[^>]*>/g, ' ');
+        cleanText = cleanText.replace(/&[a-z]+;/gi, ' ');
+        cleanText = cleanText.replace(/[{}()[\]"'`\\]/g, ' ');
+        
+        // Remove Getty Images and other media references
+        cleanText = cleanText.replace(/GettyImages[^\s]*/gi, ' ');
+        cleanText = cleanText.replace(/formula1\.com[^\s]*/gi, ' ');
+        cleanText = cleanText.replace(/media\.formula1\.com[^\s]*/gi, ' ');
+        
+        // Remove timestamps and IDs
+        cleanText = cleanText.replace(/\b20\d{2}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\b/g, ' ');
+        cleanText = cleanText.replace(/\b[A-Za-z0-9]{20,}\b/g, ' ');
+        
+        // Clean up whitespace
+        cleanText = cleanText.replace(/[,\s]+/g, ' ');
+        cleanText = cleanText.replace(/\s+/g, ' ');
+        cleanText = cleanText.trim();
+        
+        // Extract meaningful sentences with better filtering
+        const sentences = cleanText.split(/[.!?]+/)
+          .map(s => s.trim())
+          .filter(s => {
+            // Must have basic requirements
+            if (s.length < 15 || s.length > 300) return false;
+            if (!/[A-Za-z]/.test(s)) return false; // Must contain letters
+            if (s.split(' ').length < 3) return false; // At least 3 words
+            
+            // Must not contain technical jargon
+            if (s.match(/\b(module|typography|display|className|children|div|span)\b/i)) return false;
+            if (s.match(/\b[a-f0-9]{6,}\b/)) return false; // No hex codes
+            if (s.match(/^\d+$/)) return false; // Not just numbers
+            
+            // Must have some meaningful content
+            const words = s.split(' ');
+            const meaningfulWords = words.filter(word => 
+              word.length > 2 && 
+              !word.match(/^[A-Z0-9_-]+$/) && // Not all caps technical terms
+              !word.match(/^\d+$/) // Not just numbers
+            );
+            
+            return meaningfulWords.length >= 2;
+          });
+        
+        // Look for F1-specific content
+        const f1Sentences = sentences.filter(s => 
+          s.match(/\b(Formula|F1|Grand Prix|driver|team|race|championship|season|circuit|McLaren|Ferrari|Red Bull|Mercedes|Alpine|Williams|Aston Martin|Haas|Alfa Romeo|AlphaTauri)\b/i)
+        );
+        
+        // Return F1-specific content if available, otherwise general content
+        const relevantSentences = f1Sentences.length > 0 ? f1Sentences : sentences;
+        return {
+          text: relevantSentences.slice(0, 2).join('. '),
+          isClean: false
+        };
+      })
+      .filter(item => item.text && item.text.length > 20) // Filter out short results
+      .slice(0, 5); // Take more results to have options
+
+    // Prioritize clean manual content in the final response
+    const cleanContent = context.filter(item => item.isClean).slice(0, 2);
+    const scrapedContent = context.filter(item => !item.isClean).slice(0, 1);
+    const finalContent = [...cleanContent, ...scrapedContent].slice(0, 3);
+
+    // Create a more intelligent response
+    let response = '';
+    
+    if (finalContent.length === 0 || finalContent.every(item => !item.isClean && item.text.length < 100)) {
+      // If no good content found or all content is messy, use clean fallback
+      const cleanResponse = getRelevantF1Info(message);
+      response = `🏎️ **Formula 1 Information:**\n\n${cleanResponse}`;
+    } else {
+      // For mixed content, still prioritize clean fallback for better responses
+      const hasGoodCleanContent = finalContent.some(item => item.isClean && item.text.length > 50);
+      
+      if (!hasGoodCleanContent) {
+        // Use clean fallback if we don't have good clean content
+        const cleanResponse = getRelevantF1Info(message);
+        response = `🏎️ **Formula 1 Information:**\n\n${cleanResponse}`;
+      } else {
+        const responseItems = finalContent.map((item, index) => {
+          let text = item.text;
+          if (item.title) {
+            text = `**${item.title}**: ${text}`;
+          }
+          return `${index + 1}. ${text.charAt(0).toUpperCase() + text.slice(1)}`;
+        });
+        
+        response = `🏎️ **Formula 1 Information:**\n\n${responseItems.join('\n\n')}`;
+      }
+    }
+    
+    return NextResponse.json({
+      message: response,
+      sources: finalResults.slice(0, 3).map(r => r.url).filter(Boolean),
+      foundResults: finalContent.length
+    });
+    
+  } catch (error) {
+    console.error('Chat API error:', error);
+    return NextResponse.json(
+      { error: 'Failed to process your request' },
+      { status: 500 }
+    );
+  }
+}
